@@ -99,11 +99,27 @@ def validate_plan_data(df):
     
     for idx, row in df.iterrows():
         row_num = idx + 2
-        if pd.isna(row['Semester']): errors.append(f"Row {row_num}: Semester is required")
+        if pd.isna(row['Semester']):
+            errors.append(f"Row {row_num}: Semester is required")
+        else:
+            try:
+                sem_val = int(row['Semester'])
+                if not (1 <= sem_val <= 12):
+                    errors.append(f"Row {row_num}: Semester must be between 1 and 12")
+            except (ValueError, TypeError):
+                errors.append(f"Row {row_num}: Semester must be a valid number")
         if pd.isna(row['Course Name (Arabic)']): errors.append(f"Row {row_num}: Course Name (Arabic) is required")
         if pd.isna(row['Course Name (English)']): errors.append(f"Row {row_num}: Course Name (English) is required")
         if pd.isna(row['Course Code']): errors.append(f"Row {row_num}: Course Code is required")
-        if pd.isna(row['Credit Hours']): errors.append(f"Row {row_num}: Credit Hours is required")
+        if pd.isna(row['Credit Hours']):
+            errors.append(f"Row {row_num}: Credit Hours is required")
+        else:
+            try:
+                cr_val = int(row['Credit Hours'])
+                if cr_val <= 0:
+                    errors.append(f"Row {row_num}: Credit Hours must be a positive number")
+            except (ValueError, TypeError):
+                errors.append(f"Row {row_num}: Credit Hours must be a valid number")
     
     return errors
 

@@ -1,7 +1,8 @@
-from fastapi import FastAPI, Depends, HTTPException, Query, status, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, Query, status, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import insert, delete, select
+from sqlalchemy.exc import IntegrityError
 from typing import List, Optional
 from datetime import timedelta
 import models, schemas, database
@@ -77,7 +78,18 @@ def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
     return new_user
 
 @app.get("/auth/me")
-def get_current_user(token: str, db: Session = Depends(get_db)):
+def get_current_user(
+    token: Optional[str] = None,
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    # Prefer the Authorization header (Bearer <token>); fall back to query param for compatibility
+    if authorization:
+        scheme, _, header_token = authorization.partition(" ")
+        if scheme.lower() == "bearer" and header_token:
+            token = header_token
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
     payload = decode_access_token(token)
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -100,6 +112,9 @@ def login(user: schemas.LoginRequest, db: Session = Depends(get_db)):
 
 @app.get("/courses/search/", response_model=List[schemas.CourseResponse])
 def search_courses(q: str, db: Session = Depends(get_db)):
+    # Enforce a minimum query length so an empty/blank query does not return every course
+    if not q or len(q.strip()) < 1:
+        raise HTTPException(status_code=422, detail="Search query must not be empty")
     search = f"%{q}%"
     return db.query(models.Course).filter(
         (models.Course.name_ar.ilike(search)) | 
@@ -107,15 +122,27 @@ def search_courses(q: str, db: Session = Depends(get_db)):
         (models.Course.code.ilike(search))
     ).all()
 
+def serialize_course(db_course):
+    """Serialize a Course ORM object including its prerequisite codes."""
+    res = schemas.CourseResponse.model_validate(db_course)
+    res.prerequisite_codes = [p.code for p in db_course.prerequisites]
+    return res
+
 @app.get("/courses", response_model=List[schemas.CourseResponse])
 def get_courses(db: Session = Depends(get_db)):
-    return db.query(models.Course).all()
+    return [serialize_course(c) for c in db.query(models.Course).all()]
 
 @app.post("/courses", response_model=schemas.CourseResponse, status_code=201)
 def create_course(course: schemas.CourseCreate, db: Session = Depends(get_db)):
     data = course.model_dump()
     # Remove prerequisite_codes as it's not a direct column in Course model
     p_codes = data.pop('prerequisite_codes', [])
+
+    # Guard against duplicate course code before attempting insert (TC-13)
+    existing = db.query(models.Course).filter(models.Course.code == data.get("code")).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Course code already exists")
+
     db_course = models.Course(**data)
     
     # Handle prerequisites
@@ -123,10 +150,14 @@ def create_course(course: schemas.CourseCreate, db: Session = Depends(get_db)):
         prereqs = db.query(models.Course).filter(models.Course.code.in_(p_codes)).all()
         db_course.prerequisites = prereqs
 
-    db.add(db_course)
-    db.commit()
-    db.refresh(db_course)
-    return db_course
+    try:
+        db.add(db_course)
+        db.commit()
+        db.refresh(db_course)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Course code already exists")
+    return serialize_course(db_course)
 
 @app.get("/courses/{course_id}", response_model=schemas.CourseResponse)
 def get_course(course_id: int, db: Session = Depends(get_db)):
@@ -155,13 +186,22 @@ def update_course(course_id: int, course: schemas.CourseUpdate, db: Session = De
         
     db.commit()
     db.refresh(db_course)
-    return db_course
+    return serialize_course(db_course)
 
 @app.delete("/courses/{course_id}")
 def delete_course(course_id: int, db: Session = Depends(get_db)):
     db_course = db.query(models.Course).filter(models.Course.id == course_id).first()
     if not db_course:
         raise HTTPException(status_code=404, detail="Course not found")
+    # Guard: do not allow deleting a course that is still referenced by a plan (UT-19)
+    in_plan = db.execute(
+        select(models.plan_courses).where(models.plan_courses.c.course_id == course_id)
+    ).first()
+    if in_plan:
+        raise HTTPException(
+            status_code=400,
+            detail="Course is used in one or more plans and cannot be deleted",
+        )
     db.delete(db_course)
     db.commit()
     return {"message": "Course deleted"}
@@ -199,10 +239,19 @@ def get_plan(plan_id: int, db: Session = Depends(get_db)):
 
 @app.post("/plans", response_model=schemas.PlanResponse, status_code=201)
 def create_plan(plan: schemas.PlanCreate, db: Session = Depends(get_db)):
+    # Guard against duplicate plan name before insert (TC-24)
+    existing = db.query(models.Plan).filter(models.Plan.name == plan.name).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Plan name already exists")
+
     db_p = models.Plan(name=plan.name, max_credits_per_semester=plan.max_credits_per_semester)
-    db.add(db_p)
-    db.commit()
-    db.refresh(db_p)
+    try:
+        db.add(db_p)
+        db.commit()
+        db.refresh(db_p)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Plan name already exists")
     
     # Handle initial courses if provided
     if plan.courses:
@@ -265,7 +314,7 @@ def update_plan(plan_id: int, plan: schemas.PlanUpdate, db: Session = Depends(ge
 @app.delete("/plans/{plan_id}")
 def delete_plan(plan_id: int, db: Session = Depends(get_db)):
     p = db.query(models.Plan).filter(models.Plan.id == plan_id).first()
-    if not p: raise HTTPException(status_code=404)
+    if not p: raise HTTPException(status_code=404, detail="Plan not found")
     db.delete(p)
     db.commit()
     return {"message": "Deleted"}
@@ -290,7 +339,12 @@ async def import_excel(file: UploadFile = File(...), db: Session = Depends(get_d
         # Extract plan info
         plan_name = df['Plan Name'].iloc[0]
         max_credits = int(df['Max Credits Per Semester'].iloc[0])
-        
+
+        # Guard against duplicate plan name (TC-34) — return a clean 400 instead of a mid-transaction crash
+        existing_plan = db.query(models.Plan).filter(models.Plan.name == plan_name).first()
+        if existing_plan:
+            raise HTTPException(status_code=400, detail="Plan name already exists")
+
         db_p = models.Plan(name=plan_name, max_credits_per_semester=max_credits)
         db.add(db_p); db.flush()
         
@@ -420,22 +474,27 @@ Plan A courses: {json.dumps(courses_a, ensure_ascii=False)}
 Plan B courses: {json.dumps(courses_b, ensure_ascii=False)}
 """
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        # Using Gemini API (Google AI SDK style via REST)
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_api_key}"
-        response = await client.post(
-            url,
-            headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{
-                    "parts": [{"text": prompt}]
-                }],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "response_mime_type": "application/json"
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            # Using Gemini API (Google AI SDK style via REST)
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_api_key}"
+            response = await client.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                json={
+                    "contents": [{
+                        "parts": [{"text": prompt}]
+                    }],
+                    "generationConfig": {
+                        "temperature": 0.1,
+                        "response_mime_type": "application/json"
+                    }
                 }
-            }
-        )
+            )
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="The AI suggestion service timed out. Please try again.")
+    except httpx.RequestError:
+        raise HTTPException(status_code=502, detail="Could not reach the AI suggestion service. Please try again later.")
 
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Gemini API error: {response.text}")
@@ -505,7 +564,7 @@ def create_alignment(payload: schemas.AlignmentCreate, db: Session = Depends(get
 @app.delete("/alignments/{alignment_id}")
 def delete_alignment(alignment_id: int, db: Session = Depends(get_db)):
     aln = db.query(models.CourseAlignment).filter(models.CourseAlignment.id == alignment_id).first()
-    if not aln: raise HTTPException(status_code=404)
+    if not aln: raise HTTPException(status_code=404, detail="Alignment not found")
     db.delete(aln); db.commit()
     return {"message": "Deleted"}
 

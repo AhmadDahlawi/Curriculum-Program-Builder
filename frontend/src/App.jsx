@@ -131,6 +131,8 @@ const translations = {
     arabicOnly: "Arabic text only",
     englishOnly: "English text only",
     positiveOnly: "Positive numbers only",
+    invalidNumber: "Please enter a valid number",
+    invalidCodeFormat: "Invalid code format (letters, numbers and - only)",
     delete: "Delete",
     confirmDelete: "Are you sure you want to delete this item?",
     courseDeleted: "Course deleted successfully",
@@ -290,6 +292,8 @@ const translations = {
     arabicOnly: "نص عربي فقط",
     englishOnly: "نص إنجليزي فقط",
     positiveOnly: "أرقام موجبة فقط",
+    invalidNumber: "الرجاء إدخال رقم صحيح",
+    invalidCodeFormat: "صيغة الرمز غير صحيحة (حروف وأرقام و - فقط)",
     delete: "حذف",
     confirmDelete: "هل أنت متأكد من رغبتك في حذف هذا العنصر؟",
     courseDeleted: "تم حذف المقرر بنجاح",
@@ -444,15 +448,32 @@ function App({ language: initialLanguage = 'ar', setLanguage: setParentLanguage,
   }, []);
 
   // Validation Helpers
-  const isArabic = (text) => /^[\u0600-\u06FF\s0-9]+$/.test(text);
-  const isEnglish = (text) => /^[A-Za-z\s0-9]+$/.test(text);
+  // Arabic name must contain at least one real Arabic letter; whitespace/digits-only is invalid (UT-41, UT-42)
+  const isArabic = (text) => {
+    if (!text || !/[\u0600-\u06FF]/.test(text)) return false;
+    return /^[\u0600-\u06FF\s0-9]+$/.test(text);
+  };
+  const isEnglish = (text) => {
+    if (!text || !/[A-Za-z]/.test(text)) return false;
+    return /^[A-Za-z\s0-9]+$/.test(text);
+  };
 
   const validateCourseData = (data) => {
     const errors = {};
     if (!data.nameAr || !isArabic(data.nameAr)) errors.nameAr = t.arabicOnly;
     if (!data.nameEn || !isEnglish(data.nameEn)) errors.nameEn = t.englishOnly;
-    if (!data.code || data.code.trim() === '') errors.code = t.fieldRequired;
-    if (!data.credits || parseInt(data.credits) <= 0) errors.credits = t.positiveOnly;
+    // Course code must be a safe alphanumeric code (letters, digits, hyphen) — rejects XSS/symbols (UT-44)
+    if (!data.code || data.code.trim() === '') {
+      errors.code = t.fieldRequired;
+    } else if (!/^[A-Za-z0-9\- ]+$/.test(data.code.trim())) {
+      errors.code = t.invalidCodeFormat;
+    }
+    // Credits must be a clean positive integer — rejects values like '3abc' (UT-43)
+    if (data.credits === undefined || data.credits === null || String(data.credits).trim() === '') {
+      errors.credits = t.positiveOnly;
+    } else if (!/^\d+$/.test(String(data.credits).trim()) || parseInt(data.credits, 10) <= 0) {
+      errors.credits = t.invalidNumber;
+    }
     
     // Check for duplicate course codes
     if (!editingCourse) {
@@ -626,7 +647,23 @@ function App({ language: initialLanguage = 'ar', setLanguage: setParentLanguage,
       }
     }
 
-    // Allow exceeding limits but show warning later via UI
+    // Reverse-dependency check: ensure moving this course does not break any course that depends on it (TC-52)
+    const brokenDependents = [];
+    for (const dependent of courses) {
+      if (dependent.id === activeCourseId) continue;
+      if (dependent.prerequisiteCodes && dependent.prerequisiteCodes.includes(courseToMove.code)) {
+        if (parseInt(targetSemester) >= parseInt(dependent.semester)) {
+          brokenDependents.push(`${dependent.code} (${t.semester} ${dependent.semester})`);
+        }
+      }
+    }
+    if (brokenDependents.length > 0) {
+      setErrorMessage(`${courseToMove.nameAr || courseToMove.nameEn} ${t.prerequisiteMustBeBefore}: ${brokenDependents.join(', ')}`);
+      setShowErrorModal(true);
+      return;
+    }
+
+    // Apply the move
     setCourses(prev => prev.map(c => c.id === activeCourseId ? { ...c, semester: targetSemester } : c));
   };
 
@@ -1043,7 +1080,7 @@ function App({ language: initialLanguage = 'ar', setLanguage: setParentLanguage,
                   <Button variant="outline" className="flex-1" onClick={() => { setSelectedPlan(plan); setShowPlanDetails(true); }}>
                     <Eye className="w-4 h-4 mr-2" /> {t.view}
                   </Button>
-                  <Button className="flex-1 bg-gradient-to-r from-cyan-600 to-teal-600 hover:from-cyan-700 hover:to-teal-700 text-white font-semibold shadow-md transition-all active:scale-[0.98]" onClick={() => { setSelectedPlan(plan); setCourses(plan.courses || []); setPlanName(plan.name); setMaxCreditsPerSemester(plan.maxCreditsPerSemester || 18); setNumSemesters(Math.max(...(plan.courses || []).map(c => parseInt(c.semester))) || 8); setShowCreatePlanForm(true); setCurrentPage('createPlan'); }}>
+                  <Button className="flex-1 bg-gradient-to-r from-cyan-600 to-teal-600 hover:from-cyan-700 hover:to-teal-700 text-white font-semibold shadow-md transition-all active:scale-[0.98]" onClick={() => { setSelectedPlan(plan); setCourses(plan.courses || []); setPlanName(plan.name); setMaxCreditsPerSemester(plan.maxCreditsPerSemester || 18); const planSems = (plan.courses || []).map(c => parseInt(c.semester)).filter(n => !isNaN(n)); setNumSemesters(planSems.length > 0 ? Math.max(...planSems) : 8); setShowCreatePlanForm(true); setCurrentPage('createPlan'); }}>
                     <Edit className="w-4 h-4 mr-2" /> {t.edit}
                   </Button>
                   <Button className="flex-1 bg-gradient-to-r from-red-600 to-red-700 hover:from-red-700 hover:to-red-800 text-white font-semibold shadow-md transition-all active:scale-[0.98]" onClick={() => handleDeletePlan(plan)}>
@@ -1773,7 +1810,8 @@ function App({ language: initialLanguage = 'ar', setLanguage: setParentLanguage,
             <div className="grid gap-2">
               <label className={formErrors.credits ? 'text-red-500 font-bold' : ''}>{t.creditHours}</label>
               <Input 
-                type="number" 
+                type="text"
+                inputMode="numeric"
                 value={selectedCourse && !editingCourse ? selectedCourse.credits : formData.credits} 
                 onChange={(e) => !selectedCourse || editingCourse ? handleInputChange('credits', e.target.value) : null} 
                 disabled={selectedCourse && !editingCourse} 
