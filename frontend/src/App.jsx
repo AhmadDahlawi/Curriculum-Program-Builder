@@ -136,6 +136,7 @@ const translations = {
     delete: "Delete",
     confirmDelete: "Are you sure you want to delete this item?",
     courseDeleted: "Course deleted successfully",
+    cannotDeletePrereq: "Cannot delete: this course is a prerequisite for",
     planDeleted: "Plan deleted successfully",
     saveAsNew: "Save as New",
     saveAsNewPlan: "Save as New Plan",
@@ -297,6 +298,7 @@ const translations = {
     delete: "حذف",
     confirmDelete: "هل أنت متأكد من رغبتك في حذف هذا العنصر؟",
     courseDeleted: "تم حذف المقرر بنجاح",
+    cannotDeletePrereq: "لا يمكن الحذف: هذا المقرر متطلب سابق لـ",
     planDeleted: "تم حذف الخطة بنجاح",
     saveAsNew: "حفظ كجديد",
     saveAsNewPlan: "حفظ كخطة جديدة",
@@ -531,8 +533,32 @@ function App({ language: initialLanguage = 'ar', setLanguage: setParentLanguage,
   // --- Delete Handlers ---
 
   const handleDeleteCourse = (course) => {
+    // Prevent deletion if this course is a prerequisite for other courses in the plan
+    const dependents = courses.filter(
+      c => c.id !== course.id && c.prerequisiteCodes && c.prerequisiteCodes.includes(course.code)
+    );
+    if (dependents.length > 0) {
+      const names = dependents.map(c => c.code || (language === 'ar' ? c.nameAr : c.nameEn));
+      setErrorMessage(`${t.cannotDeletePrereq}: ${names.join(', ')}`);
+      setShowErrorModal(true);
+      return;
+    }
     setDeleteTarget({ type: 'course', item: course });
     setShowDeleteConfirm(true);
+  };
+
+  // Remove a course from the current plan board (guarded against breaking prerequisites)
+  const handleRemoveCourseFromPlan = (course) => {
+    const dependents = courses.filter(
+      c => c.id !== course.id && c.prerequisiteCodes && c.prerequisiteCodes.includes(course.code)
+    );
+    if (dependents.length > 0) {
+      const names = dependents.map(c => c.code || (language === 'ar' ? c.nameAr : c.nameEn));
+      setErrorMessage(`${t.cannotDeletePrereq}: ${names.join(', ')}`);
+      setShowErrorModal(true);
+      return;
+    }
+    setCourses(prev => prev.filter(c => c.id !== course.id));
   };
 
   const handleDeletePlan = (plan) => {
@@ -758,7 +784,7 @@ function App({ language: initialLanguage = 'ar', setLanguage: setParentLanguage,
                     }}>
                       <Edit className="h-4 w-4" />
                     </Button>
-                    <Button size="icon" variant="ghost" className="h-8 w-8 text-red-600" onClick={() => setCourses(prev => prev.filter(c => c.id !== course.id))}>
+                    <Button size="icon" variant="ghost" className="h-8 w-8 text-red-600" onClick={() => handleRemoveCourseFromPlan(course)}>
                       <Trash2 className="h-4 w-4" />
                     </Button>
                   </div>
